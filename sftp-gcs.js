@@ -15,6 +15,7 @@ const { SFTPStream } = require('ssh2-streams');
 const PATH = require('path');
 const winston = require('winston');
 const { format } = winston;
+const ipRangeCheck = require("ip-range-check");
 
 // Imports the Google Cloud client library for Winston
 const { LoggingWinston } = require('@google-cloud/logging-winston');
@@ -40,16 +41,27 @@ const MODE_DIR = fs.constants.S_IFDIR | fs.constants.S_IRWXU | fs.constants.S_IR
 // * --public-key-file PUBLIC-KEY file
 // * --service-account-key-file KEY_FILE
 //
+
+const SFTP_BUCKET = process.env.SFTP_BUCKET;
+const DEFAULT_PORT = process.env.SFTP_PORT || 22;
+const DEFAULT_USER = process.env.SFTP_USER || '';
+const DEFAULT_PASSWORD = process.env.SFTP_PASSWORD || '';
+const DEFAULT_PUBLIC_KEY_FILE = process.env.SFTP_PUBLIC_KEY_FILE || '';
+const DEFAULT_SERVICE_ACCOUNT_FILE = process.env.SFTP_SERVICE_ACCOUNT_FILE || '';
+const DEFAULT_LOG_LEVEL = process.env.SFTP_LOG_LEVEL || '';
+const DEFAULT_ALLOWED_IPS = process.env.SFTP_ALLOWED_IPS || null;
+
 const argv = require('yargs')
     .usage('$0 --bucket BUCKET_NAME')
     .env('SFTP_GCS')
-    .options('bucket').describe('bucket', 'GCS bucket to work with').string('bucket').nargs('bucket', 1).demandOption('bucket', 'Must supply a GCS bucket')
-    .options('port').describe('port', 'Port number to listen upon').number('port').nargs('port', 1).default('port', 22, 'Default port is 22')
-    .options('user').describe('user', 'Userid for SFTP client').string('user').nargs('user', 1).default('user', '')
-    .options('password').describe('password', 'Password for SFTP client').string('password').nargs('password', 1).default('password', '')
-    .options('public-key-file').describe('public-key-file', 'Publish SSH key').string('public-key-file').nargs('public-key-file', 1).default('public-key-file', '')
-    .options('service-account-key-file').describe('service-account-key-file', 'Key file for service account').string('service-account-key-file').nargs('service-account-key-file', 1).default('service-account-key-file', '')
-    .options('debug').describe('debug', 'Set the debugging log level').string('debug').nargs('debug', 1).default('info', '')
+    .options('bucket').describe('bucket', 'GCS bucket to work with').string('bucket').nargs('bucket', 1).default('bucket', SFTP_BUCKET)
+    .options('port').describe('port', 'Port number to listen upon').number('port').nargs('port', 1).default('port', DEFAULT_PORT, 'Default port is 22')
+    .options('user').describe('user', 'Userid for SFTP client').string('user').nargs('user', 1).default('user', DEFAULT_USER)
+    .options('password').describe('password', 'Password for SFTP client').string('password').nargs('password', 1).default('password', DEFAULT_PASSWORD)
+    .options('public-key-file').describe('public-key-file', 'Publish SSH key').string('public-key-file').nargs('public-key-file', 1).default('public-key-file', DEFAULT_PUBLIC_KEY_FILE)
+    .options('service-account-key-file').describe('service-account-key-file', 'Key file for service account').string('service-account-key-file').nargs('service-account-key-file', 1).default('service-account-key-file', DEFAULT_SERVICE_ACCOUNT_FILE)
+    .options('debug').describe('debug', 'Set the debugging log level').string('debug').nargs('debug', 1).default('debug', DEFAULT_LOG_LEVEL)
+    .options('allowed_ips').describe('allowed_ips', 'Set allowed IP addresses.').string('allowed_ips').nargs('allowed_ips', 1).default('allowed_ips', DEFAULT_ALLOWED_IPS)
     .argv;
 
 // Uncomment the following to log the passed in arguments.
@@ -91,6 +103,11 @@ const SERVER_PORT = argv.port
 // If the byucket name begins with "gs://", remove it.
 const BUCKET_NAME = argv.bucket.replace(/gs:\/\//, '');
 
+if (BUCKET_NAME === '') {
+    logger.error('Please provide a bucket name either as an environment variable or as --bucket option.');
+    process.exit(1);
+}
+
 let allowedPubKey = null;
 if (publicKeyFile !== "") {
     allowedPubKey = ssh2.utils.parseKey(fs.readFileSync(publicKeyFile));
@@ -102,6 +119,9 @@ if (serviceAccountKeyFile.length !== "") {
 }
 const storage = new Storage(storageOptions); // Get access to the GCS environment
 const bucket = storage.bucket(BUCKET_NAME); // The bucket is a global and provides access to the GCS data.
+
+const allowed_ips = (argv['allowed_ips'] || '*').split(';');
+
 
 /**
  * We need a host key to be used to identify our server.  We will look for such a key in a few places.
@@ -226,8 +246,24 @@ new ssh2.Server({
     hostKeys: [getHostKey()],
     "greeting": "SFTP-GCS demon",
     "banner": "SFTP-GCS demon"
-}, function (client) {
+}, function (client, info) {
     logger.debug('Client connected!');
+    logger.debug(`Client IP: ${info.ip}`);
+
+    let ip_match = false;
+    if (allowed_ips.length === 1 && allowed_ips[0] === '*') {
+        ip_match = true;
+    } else {
+        if (ipRangeCheck(info.ip, allowed_ips)){
+            logger.debug('Found IP match');
+            ip_match = true;
+        }
+    }
+
+    if (!ip_match) {
+        logger.debug(`No IP match, closing connection from ${info.ip}`);
+        client.end();
+    }
 
     // ctx.username - The identity of the user asking to be authenticated,
     // ctx.method - How is the request being asked to authenticate?
@@ -319,6 +355,7 @@ new ssh2.Server({
 
     client.on('ready', function () {
         logger.debug('Client authenticated!');
+
 
         client.on('session', function (accept, reject) {
             const session = accept();
@@ -967,7 +1004,13 @@ new ssh2.Server({
     logger.info(`Username: ${allowedUser === '' ? 'Not set' : allowedUser}`);
     logger.info(`Password: ${allowedPassword === '' ? 'Not set' : '********'}`);
     logger.info(`Public key file: ${publicKeyFile === '' ? 'Not set' : publicKeyFile}`);
-    logger.info(`Service account key file: ${serviceAccountKeyFile === '' ? 'Not set' : serviceAccountKeyFile}`);
+    logger.info(`Service account key file: ${serviceAccountKeyFile === '' ? 'Not set' : 
+        serviceAccountKeyFile}`);
+    if (allowed_ips.length === 1 && allowed_ips[0] === '*'){
+        logger.info('Allowing all IPs');
+    } else {
+        logger.info(`Allowing only following IPs: ${allowed_ips}`);
+    }
 }).on('error', (err) => {
     // Capture any networking exception.  A common error is that we are asking the sftp-gcs server
     // to listen on a port that is already in use.  Check for that error and call it out specifically.
